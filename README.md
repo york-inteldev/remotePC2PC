@@ -7,10 +7,14 @@ PC B displays a UVC USB capture adapter and forwards mouse/keyboard events to PC
 ### Existing Pico UART configuration
 
 ```text
-PC B (USB Host)
-  └─ USB CDC ─ Pico 1 (USB Device)
-                 └─ UART1, GP4/GP5 ─ Pico 2
-                                      └─ USB HID ─ PC C (USB Host)
+PC A (Remote Desktop client)
+  └─ RDP session ───────────────────────────────> PC B (USB Host)
+                                                    ├─ PC_App (window shown to PC A over RDP)
+                                                    │   └─ displays captured PC C video
+                                                    ├─ USB CDC ──> Pico 1 (USB Device)
+                                                    │                └─ UART1, GP4/GP5 ──> Pico 2
+                                                    │                                       └─ USB HID ──> PC C (USB Host)
+                                                    └─ USB video <── HDMI-USB capture adapter <── HDMI ── PC C
 ```
 
 USB wiring between the Pico boards:
@@ -23,15 +27,22 @@ USB wiring between the Pico boards:
 
 Use 3.3 V UART logic only. Do not connect the two boards' VBUS/5 V lines together. Each Pico is powered by its own USB connection to its respective PC.
 
-The USB roles are **PC B = Host, Pico 1 = CDC Device** and **PC C = Host, Pico 2 = HID Device**. The USB capture adapter connects to PC B and receives PC C's HDMI output. No Raspberry Pi 4 or Arduino Due is required.
+The PC_App window on PC B is viewed from PC A over RDP. The HDMI-USB capture adapter feeds PC C's HDMI output to PC_App; the adapter and Pico 1 connect to PC B, while Pico 2 presents USB HID to PC C. No Raspberry Pi 4 or Arduino Due is required.
 
 ### ESP32-S3 BLE GATT configuration
 
 ```text
-PC B application (BLE GATT client)
-  └─ BLE custom GATT service ─ ESP32-S3 (BLE GATT server)
-                                └─ USB keyboard/mouse HID ─ PC C
+PC A (Remote Desktop client)
+  └─ RDP session ───────────────────────────────> PC B
+                                                   ├─ PC_App (its window is shown to PC A over RDP)
+                                                   │   ├─ displays the captured PC C video
+                                                   │   └─ BLE GATT client
+                                                   │       ── BLE ──> ESP32-S3 (BLE GATT server)
+                                                   │                    └─ USB HID keyboard/mouse ──> PC C
+                                                   └─ USB video <── HDMI-USB capture adapter <── HDMI ── PC C
 ```
+
+PC A views PC C's HDMI output in the PC_App window on PC B through the RDP session. The HDMI-USB capture adapter connects PC C's HDMI output to PC B over USB, and PC_App displays that video. For control, PC_App sends input over BLE GATT to the ESP32-S3, which presents USB keyboard/mouse HID to PC C.
 
 This is a separate firmware option; it does not use either Pico or the UART wiring. The ESP32-S3 GATT firmware and board setup are documented in [PC_to_PC_adaptor/ESP32-BLE/remotePC2PC_ESP32S3_GATT_HID/README.md](./PC_to_PC_adaptor/ESP32-BLE/remotePC2PC_ESP32S3_GATT_HID/README.md). The earlier [NodeMCU BLE-HID sketch](./PC_to_PC_adaptor/ESP32-BLE/README.md) remains available as a legacy BLE-HID-to-PC-C option, but it does not provide USB HID.
 

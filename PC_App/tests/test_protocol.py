@@ -38,6 +38,12 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             protocol.mouse_button_packet(0, True)
 
+    def test_maximum_frame_fits_default_ble_att_write_size(self):
+        packet = protocol.encode_frame(0xFF, bytes(protocol.MAX_PAYLOAD))
+
+        self.assertEqual(len(packet), 13)
+        self.assertLessEqual(len(packet), 20)
+
     def test_mouse_wheel_directions_use_distinct_messages(self):
         vertical = protocol.FrameDecoder().feed(
             protocol.mouse_wheel_packet(1)

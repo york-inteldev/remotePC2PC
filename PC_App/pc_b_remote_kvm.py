@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -13,9 +14,11 @@ try:
     import serial
     from PIL import Image, ImageTk
     from serial.tools import list_ports
+    from ble_transport import BLE_DEVICE_NAME, BleGattClient
 except ImportError as exc:
     raise SystemExit(
-        "Required packages are missing. Run: py -m pip install -r requirements.txt"
+        "Required packages are missing. From the repository root, run: "
+        "py -m pip install -r .\\PC_App\\requirements.txt"
     ) from exc
 
 import protocol
@@ -132,12 +135,20 @@ class RemoteKvmApp:
         self.camera: CameraCapture | None = None
         self.serial_port = None
         self.serial_ready = False
+        self.ble_link = BleGattClient()
+        self.ble_ready = False
+        self.ble_connecting = False
+        self.ble_scanning = False
+        self.active_transport: str | None = None
+        self.ble_devices = {}
         self.closing = False
         self._mouse_hook_handle = None
         self._mouse_hook_proc = None
         self.forward_input = tk.BooleanVar(value=False)
         self.camera_index = tk.StringVar(value="0")
+        self.transport_mode = tk.StringVar(value="BLE GATT (ESP32-S3)")
         self.port_name = tk.StringVar()
+        self.ble_device_name = tk.StringVar()
         self.target_width = tk.StringVar(value="1920")
         self.target_height = tk.StringVar(value="1080")
         self.status = tk.StringVar(value="Open the USB capture device to begin.")
@@ -152,7 +163,7 @@ class RemoteKvmApp:
         self._wheel_remainder = 0.0
 
         self._build_ui()
-        self._refresh_ports()
+        self._on_transport_changed()
         self.root.bind("<FocusOut>", self._on_focus_out, add="+")
         self.root.bind("<Unmap>", self._on_window_unmap, add="+")
         self.root.bind_all("<KeyPress>", self._on_key_press, add="+")
@@ -160,6 +171,7 @@ class RemoteKvmApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(self.CAMERA_POLL_MS, self._poll_camera)
         self.root.after(self.HEARTBEAT_MS, self._send_heartbeat)
+        self.root.after(50, self._poll_ble_events)
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -176,28 +188,45 @@ class RemoteKvmApp:
             row=0, column=2, padx=(0, 14)
         )
 
-        ttk.Label(controls, text="Pico 1 COM:").grid(row=0, column=3, padx=(0, 4))
-        self.port_box = ttk.Combobox(
-            controls, width=12, textvariable=self.port_name, state="readonly"
+        ttk.Label(controls, text="Transport:").grid(
+            row=0, column=3, padx=(0, 4)
         )
-        self.port_box.grid(row=0, column=4, padx=(0, 4))
-        ttk.Button(controls, text="Refresh", command=self._refresh_ports).grid(
-            row=0, column=5, padx=(0, 4)
+        self.transport_box = ttk.Combobox(
+            controls,
+            width=22,
+            textvariable=self.transport_mode,
+            values=("USB CDC (Pico)", "BLE GATT (ESP32-S3)"),
+            state="readonly",
         )
+        self.transport_box.grid(row=0, column=4, sticky="w")
+        self.transport_box.bind("<<ComboboxSelected>>", self._on_transport_changed)
+
+        self.device_label = ttk.Label(controls, text="Pico 1 COM:")
+        self.device_label.grid(row=1, column=0, padx=(0, 4), pady=(8, 0), sticky="e")
+        self.device_box = ttk.Combobox(
+            controls, width=38, textvariable=self.port_name, state="readonly"
+        )
+        self.device_box.grid(
+            row=1, column=1, columnspan=3, padx=(0, 4), pady=(8, 0), sticky="w"
+        )
+        self.refresh_button = ttk.Button(
+            controls, text="Refresh", command=self._refresh_ports
+        )
+        self.refresh_button.grid(row=1, column=4, padx=(0, 4), pady=(8, 0))
         self.connect_button = ttk.Button(
-            controls, text="Connect", command=self._toggle_serial
+            controls, text="Connect", command=self._toggle_connection
         )
-        self.connect_button.grid(row=0, column=6)
+        self.connect_button.grid(row=1, column=5, pady=(8, 0))
 
         ttk.Label(controls, text="PC C resolution:").grid(
-            row=1, column=0, pady=(8, 0), padx=(0, 4), sticky="e"
+            row=2, column=0, pady=(8, 0), padx=(0, 4), sticky="e"
         )
         ttk.Entry(controls, width=7, textvariable=self.target_width).grid(
-            row=1, column=1, pady=(8, 0), sticky="w"
+            row=2, column=1, pady=(8, 0), sticky="w"
         )
-        ttk.Label(controls, text="×").grid(row=1, column=2, pady=(8, 0))
+        ttk.Label(controls, text="×").grid(row=2, column=2, pady=(8, 0))
         ttk.Entry(controls, width=7, textvariable=self.target_height).grid(
-            row=1, column=3, pady=(8, 0), sticky="w"
+            row=2, column=3, pady=(8, 0), sticky="w"
         )
         self.forward_checkbox = ttk.Checkbutton(
             controls,
@@ -207,7 +236,7 @@ class RemoteKvmApp:
             state="disabled",
         )
         self.forward_checkbox.grid(
-            row=1, column=4, columnspan=3, pady=(8, 0), sticky="w"
+            row=2, column=4, columnspan=2, pady=(8, 0), sticky="w"
         )
 
         self.canvas = tk.Canvas(self.root, background="black", highlightthickness=0)
@@ -267,17 +296,168 @@ class RemoteKvmApp:
 
     def _refresh_ports(self) -> None:
         ports = sorted(port.device for port in list_ports.comports())
-        self.port_box["values"] = ports
+        self.device_box["values"] = ports
         if self.port_name.get() not in ports:
             self.port_name.set(ports[0] if ports else "")
-        if not ports and self.serial_port is None:
+        if (
+            not ports
+            and self.serial_port is None
+            and self.transport_mode.get() == "USB CDC (Pico)"
+        ):
             self.status.set("No serial ports found. Connect Pico 1 to PC B.")
+        self._update_connection_controls()
 
-    def _toggle_serial(self) -> None:
+    def _on_transport_changed(self, _event=None) -> None:
+        if self.transport_mode.get() == "USB CDC (Pico)":
+            self.device_label.configure(text="Pico 1 COM:")
+            self.device_box.configure(textvariable=self.port_name)
+            self.refresh_button.configure(
+                text="Refresh", command=self._refresh_ports
+            )
+            self._refresh_ports()
+        else:
+            self.device_label.configure(text="ESP32-S3 BLE:")
+            self.device_box.configure(textvariable=self.ble_device_name)
+            self.device_box["values"] = tuple(self.ble_devices)
+            self.refresh_button.configure(text="Scan BLE", command=self._scan_ble)
+            if not self.ble_devices:
+                self.status.set(f"Scan for {BLE_DEVICE_NAME}.")
+            self._update_connection_controls()
+
+    def _scan_ble(self) -> None:
+        if self.ble_scanning or self._connection_busy():
+            return
+        self.ble_scanning = True
+        self.ble_device_name.set("")
+        self.status.set("Scanning for BLE devices...")
+        self._update_connection_controls()
+        try:
+            self.ble_link.scan()
+        except RuntimeError as exc:
+            self.ble_scanning = False
+            self.status.set(f"Could not start BLE scan: {exc}")
+            self._update_connection_controls()
+
+    def _poll_ble_events(self) -> None:
+        if self.closing:
+            return
+        while True:
+            try:
+                event, value = self.ble_link.events.get_nowait()
+            except queue.Empty:
+                break
+
+            if event == "scan_complete":
+                devices = sorted(
+                    value,
+                    key=lambda device: (
+                        (device.name or "").casefold(),
+                        device.address.casefold(),
+                    ),
+                )
+                self.ble_devices.clear()
+                for device in devices:
+                    name = device.name or "Unnamed BLE device"
+                    label = f"{name} [{device.address}]"
+                    self.ble_devices[label] = device
+                labels = tuple(self.ble_devices)
+                self.device_box["values"] = labels
+                preferred = next(
+                    (
+                        label
+                        for label in labels
+                        if label.startswith(f"{BLE_DEVICE_NAME} [")
+                    ),
+                    labels[0] if labels else "",
+                )
+                self.ble_device_name.set(preferred)
+                self.ble_scanning = False
+                self.status.set(
+                    f"Found {len(labels)} BLE device(s). "
+                    f"Select {BLE_DEVICE_NAME}."
+                    if labels
+                    else "No BLE devices found. Check the ESP32-S3 power and range."
+                )
+                self._update_connection_controls()
+            elif event == "scan_error":
+                self.ble_scanning = False
+                self.status.set(f"BLE scan failed: {value}")
+                self._update_connection_controls()
+            elif event == "connected":
+                if self.closing:
+                    self.ble_link.disconnect()
+                    continue
+                self.ble_connecting = False
+                self.ble_ready = True
+                self.active_transport = "ble"
+                self._update_connection_controls()
+                if not self._write_packet(protocol.release_all_packet()):
+                    continue
+                device_name = getattr(value, "name", None) or getattr(
+                    value, "address", "ESP32-S3"
+                )
+                self.status.set(f"Connected to {device_name} over BLE GATT.")
+            elif event == "connect_error":
+                self._drop_ble(f"BLE connection failed: {value}")
+            elif event == "write_error":
+                self._drop_ble(f"BLE command write failed: {value}")
+            elif event == "disconnected":
+                if self.active_transport == "ble" or self.ble_connecting:
+                    self._drop_ble("BLE connection lost.")
+            elif event == "disconnect_error":
+                self.status.set(f"BLE disconnect error: {value}")
+
+        if not self.closing:
+            self.root.after(50, self._poll_ble_events)
+
+    def _connection_ready(self) -> bool:
+        return self.serial_ready or self.ble_ready
+
+    def _connection_busy(self) -> bool:
+        return (
+            self.serial_port is not None
+            or self.ble_connecting
+            or self.ble_scanning
+        )
+
+    def _update_connection_controls(self) -> None:
+        busy = self._connection_busy()
+        ready = self._connection_ready()
+        self.transport_box.configure(state="disabled" if busy or ready else "readonly")
+        self.device_box.configure(state="disabled" if busy or ready else "readonly")
+        self.refresh_button.configure(
+            state="disabled" if busy or ready else "normal"
+        )
+        if ready:
+            self.connect_button.configure(text="Disconnect", state="normal")
+        elif self.ble_connecting:
+            self.connect_button.configure(text="Connecting...", state="disabled")
+        elif self.ble_scanning:
+            self.connect_button.configure(text="Connect", state="disabled")
+        elif self.serial_port is not None:
+            self.connect_button.configure(text="Cancel", state="normal")
+        else:
+            self.connect_button.configure(text="Connect", state="normal")
+        self.forward_checkbox.configure(state="normal" if ready else "disabled")
+
+    def _toggle_connection(self) -> None:
         if self.serial_port is not None:
             self._send_all_up()
             self._drop_serial("Disconnected.")
             return
+        if self.ble_ready:
+            self._send_all_up()
+            self._drop_ble("Disconnected.")
+            return
+        if self.ble_connecting:
+            return
+
+        if self.transport_mode.get() == "USB CDC (Pico)":
+            self._connect_serial()
+        else:
+            self._connect_ble()
+
+    def _connect_serial(self) -> None:
 
         name = self.port_name.get()
         if not name:
@@ -294,17 +474,38 @@ class RemoteKvmApp:
             port.dtr = False
             self.serial_port = port
             self.serial_ready = False
-            self.connect_button.configure(text="Disconnect")
+            self.active_transport = "serial"
+            self._update_connection_controls()
             self.status.set(f"Connected to {name}; initializing CDC...")
             self.root.after(300, lambda: self._finish_serial_connect(port))
         except (serial.SerialException, OSError) as exc:
+            self.active_transport = None
+            self._update_connection_controls()
             self.status.set(f"Could not open {name}: {exc}")
+
+    def _connect_ble(self) -> None:
+        label = self.ble_device_name.get()
+        device = self.ble_devices.get(label)
+        if device is None:
+            self.status.set(f"Scan for and select {BLE_DEVICE_NAME} first.")
+            return
+
+        self.ble_connecting = True
+        self.active_transport = "ble"
+        self._update_connection_controls()
+        self.status.set(
+            f"Connecting to {getattr(device, 'name', None) or device.address}..."
+        )
+        try:
+            self.ble_link.connect(device)
+        except RuntimeError as exc:
+            self._drop_ble(f"Could not start BLE connection: {exc}")
 
     def _finish_serial_connect(self, port) -> None:
         if self.closing or self.serial_port is not port:
             return
         self.serial_ready = True
-        self.forward_checkbox.configure(state="normal")
+        self._update_connection_controls()
         self._write_packet(protocol.release_all_packet())
         if self.serial_port is port:
             self.status.set(f"Connected to Pico 1 at {self.BAUD_RATE} baud.")
@@ -313,9 +514,8 @@ class RemoteKvmApp:
         port = self.serial_port
         self.serial_port = None
         self.serial_ready = False
+        self.active_transport = None
         self.forward_input.set(False)
-        self.forward_checkbox.configure(state="disabled")
-        self.connect_button.configure(text="Connect")
         self._reset_pointer_state()
         if self.closing:
             self._uninstall_mouse_hook()
@@ -326,32 +526,51 @@ class RemoteKvmApp:
                 port.close()
             except (serial.SerialException, OSError) as exc:
                 status = f"{status} Serial close error: {exc}"
+        self._update_connection_controls()
+        self.status.set(status)
+
+    def _drop_ble(self, status: str) -> None:
+        self.ble_ready = False
+        self.ble_connecting = False
+        self.active_transport = None
+        self.forward_input.set(False)
+        self._reset_pointer_state()
+        if self.closing:
+            self._uninstall_mouse_hook()
+        else:
+            self.root.after_idle(self._uninstall_mouse_hook)
+        self.ble_link.disconnect()
+        self._update_connection_controls()
         self.status.set(status)
 
     def _write_packet(self, packet: bytes) -> bool:
         port = self.serial_port
-        if port is None or not self.serial_ready:
-            return False
-        try:
-            written = port.write(packet)
-            if written != len(packet):
-                raise serial.SerialTimeoutException(
-                    f"Only {written} of {len(packet)} bytes were written."
-                )
-            return True
-        except (serial.SerialException, OSError) as exc:
-            self._drop_serial(f"CDC connection lost: {exc}")
-            return False
+        if self.serial_ready and port is not None:
+            try:
+                written = port.write(packet)
+                if written != len(packet):
+                    raise serial.SerialTimeoutException(
+                        f"Only {written} of {len(packet)} bytes were written."
+                    )
+                return True
+            except (serial.SerialException, OSError) as exc:
+                self._drop_serial(f"CDC connection lost: {exc}")
+                return False
+        if self.ble_ready:
+            if self.ble_link.send(packet):
+                return True
+            self._drop_ble("BLE command could not be queued.")
+        return False
 
     def _send_heartbeat(self) -> None:
         if self.closing:
             return
-        if self.serial_ready:
+        if self._connection_ready():
             self._write_packet(protocol.heartbeat_packet())
         self.root.after(self.HEARTBEAT_MS, self._send_heartbeat)
 
     def _send_all_up(self) -> None:
-        if self.serial_ready:
+        if self._connection_ready():
             self._write_packet(protocol.release_all_packet())
         self._reset_pointer_state()
 
@@ -360,7 +579,7 @@ class RemoteKvmApp:
         if not self.forward_input.get():
             self._uninstall_mouse_hook()
             self._send_all_up()
-        elif self.serial_ready:
+        elif self._connection_ready():
             try:
                 self._install_mouse_hook()
             except OSError as exc:
@@ -371,7 +590,7 @@ class RemoteKvmApp:
                 )
 
     def _is_forwarding(self) -> bool:
-        return self.forward_input.get() and self.serial_ready
+        return self.forward_input.get() and self._connection_ready()
 
     def _reset_pointer_state(self) -> None:
         self._inside_video = False
@@ -640,7 +859,11 @@ class RemoteKvmApp:
         self.closing = True
         self._uninstall_mouse_hook()
         self._send_all_up()
-        self._drop_serial("Closed.")
+        if self.serial_port is not None:
+            self._drop_serial("Closed.")
+        elif self.ble_ready or self.ble_connecting:
+            self._drop_ble("Closed.")
+        self.ble_link.close()
         self._stop_camera()
         self.root.destroy()
 

@@ -110,7 +110,9 @@ class CameraCapture:
 
     def latest_frame(self):
         with self._lock:
-            return None if self._frame is None else self._frame.copy()
+            frame = self._frame
+            self._frame = None
+            return frame
 
     @property
     def error(self) -> str | None:
@@ -244,6 +246,7 @@ class RemoteKvmApp:
         self._placeholder = self.canvas.create_text(
             0, 0, text="Open the USB capture device", fill="white", tags="placeholder"
         )
+        self._video = self.canvas.create_image(0, 0, anchor="nw", state="hidden")
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.canvas.bind("<Motion>", self._on_mouse_motion)
         self.canvas.bind("<Leave>", self._on_canvas_leave)
@@ -283,7 +286,7 @@ class RemoteKvmApp:
         self._stop_camera()
         self._last_frame = None
         self._image_rect = None
-        self.canvas.delete("video")
+        self.canvas.itemconfigure(self._video, image="", state="hidden")
         self.canvas.itemconfigure(self._placeholder, state="normal")
         self.camera = CameraCapture(index)
         self.camera.start()
@@ -624,17 +627,15 @@ class RemoteKvmApp:
         left = (canvas_width - display_width) / 2
         top = (canvas_height - display_height) / 2
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         if (display_width, display_height) != (frame_width, frame_height):
-            rgb = cv2.resize(
-                rgb, (display_width, display_height), interpolation=cv2.INTER_AREA
+            frame = cv2.resize(
+                frame, (display_width, display_height), interpolation=cv2.INTER_AREA
             )
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.canvas.itemconfigure(self._placeholder, state="hidden")
-        self.canvas.delete("video")
-        self.canvas.create_image(
-            left, top, image=self._photo, anchor="nw", tags="video"
-        )
+        self.canvas.coords(self._video, left, top)
+        self.canvas.itemconfigure(self._video, image=self._photo, state="normal")
         self._image_rect = (left, top, display_width, display_height)
 
     def _on_canvas_resize(self, event) -> None:

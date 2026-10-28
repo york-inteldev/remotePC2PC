@@ -46,6 +46,30 @@ Mouse positions in the displayed video are normalized to `[0, 1]`. Changes betwe
 
 Keyboard events are sent as USB HID usages. PC C's keyboard layout determines the resulting characters. Common keys, modifiers, function/keypad keys, and Japanese IME keys are mapped.
 
+## Performance and implementation choice
+
+The capture thread keeps only the newest unread frame; the UI draws each captured
+frame at most once and redraws the last frame when the window is resized.
+Scaling happens before BGR-to-RGB conversion, and the canvas image item is
+reused. This avoids unnecessary frame copies and work on pixels that will not
+be displayed. The UI still polls approximately every 33 ms, so this is not a
+guarantee of 30 FPS or a bound on end-to-end latency.
+
+On one Windows development PC, a synthetic 1920x1080 to 960x540 OpenCV
+conversion benchmark (100 iterations, excluding capture, Tk display, RDP and
+device I/O) had median times of 5.269 ms for the previous copy/convert/resize
+sequence and 1.480 ms for resize/convert. The output pixels were identical for
+that input. These numbers are illustrative, not hardware or end-to-end results.
+
+A C# rewrite is not currently justified by this measurement: OpenCV already
+performs the pixel operations in native code, while capture, Tk display, RDP,
+and USB/BLE latency have not been measured on the target system. First measure
+frame age and input-to-response latency with the actual capture device and both
+ends of the RDP connection. If UI rendering or capture is then the bottleneck,
+a Windows-specific C# prototype using an appropriate native video pipeline
+could be compared under the same conditions before replacing the application.
+Retain the existing framed protocol and release/heartbeat behavior in any port.
+
 ## Input protocol
 
 The Pico 1 firmware transparently forwards USB CDC bytes to Pico 2 over UART. The ESP32-S3 firmware receives the same framed bytes as one BLE GATT write per frame. All multi-byte values are little-endian. Each application frame is:

@@ -29,10 +29,10 @@ class BleGattClient:
         self._start_lock = threading.Lock()
         self._connected = threading.Event()
         self._client: BleakClient | None = None
-        self._command_characteristic = None
         self._write_response = False
         self._write_queue: asyncio.Queue[bytes] | None = None
         self._writer_task: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     def scan(self) -> None:
         future = self._submit(
@@ -166,7 +166,6 @@ class BleGattClient:
                     "The RemotePC2PC command characteristic is not writable."
                 )
 
-            self._command_characteristic = characteristic
             self._write_queue = asyncio.Queue(maxsize=MAX_QUEUED_COMMANDS)
             self._connected.set()
             self._writer_task = asyncio.create_task(
@@ -176,7 +175,6 @@ class BleGattClient:
         except Exception:
             self._connected.clear()
             self._client = None
-            self._command_characteristic = None
             if client.is_connected:
                 await client.disconnect()
             raise
@@ -200,7 +198,7 @@ class BleGattClient:
             except Exception as exc:
                 self.events.put(("write_error", str(exc)))
                 self._discard_pending_packets(write_queue)
-                asyncio.create_task(self._disconnect())
+                self._schedule_disconnect()
                 return
             finally:
                 write_queue.task_done()
@@ -235,14 +233,19 @@ class BleGattClient:
             self.events.put(
                 ("write_error", "The BLE command queue is full; disconnecting.")
             )
-            asyncio.create_task(self._disconnect())
+            self._schedule_disconnect()
+
+    def _schedule_disconnect(self) -> None:
+        # The event loop keeps only weak references to tasks.
+        task = asyncio.create_task(self._disconnect())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def _on_disconnected(self, client: BleakClient) -> None:
         if client is not self._client:
             return
         self._connected.clear()
         self._client = None
-        self._command_characteristic = None
         writer_task = self._writer_task
         self._writer_task = None
         if writer_task is not None and not writer_task.done():

@@ -90,7 +90,7 @@ The checksum is the XOR of the message type, payload length, and every payload b
 | `06` heartbeat | empty; sent every 500 ms |
 | `07` horizontal wheel | signed 8-bit delta |
 
-The maximum current frame is 13 bytes, which fits within the default 20-byte ATT write payload. The Pico 2 and ESP32-S3 release held inputs after 1.5 seconds without a heartbeat; the ESP32-S3 also releases inputs on BLE disconnect.
+The maximum current frame is 13 bytes, which fits within the default 20-byte ATT write payload. The Pico 2 and ESP32-S3 release held inputs after 1.5 seconds without a heartbeat; the ESP32-S3 also releases inputs on BLE disconnect. After an ESP32-S3 heartbeat timeout, input commands are ignored until a valid heartbeat arrives, while release-all remains available.
 
 For the legacy NodeMCU firmware, PC C receives BLE HID rather than USB HID. BIOS/UEFI input is not guaranteed because Bluetooth support may not be available before the operating system starts.
 
@@ -106,3 +106,18 @@ try {
     Pop-Location
 }
 ```
+
+The ESP32-S3 hardware regression test is skipped unless explicitly enabled. To run it, connect the board's native USB port to the same Windows PC that runs the BLE client, and substitute the board's BLE address shown by **Scan BLE**:
+
+```powershell
+$env:REMOTE_KVM_S3_BLE_ADDRESS = "AA:BB:CC:DD:EE:FF"
+Push-Location .\PC_App
+try {
+    & ..\.venv\Scripts\python.exe -m unittest discover -s .\tests -p test_esp32_s3_hardware.py -v
+} finally {
+    Pop-Location
+    Remove-Item Env:\REMOTE_KVM_S3_BLE_ADDRESS
+}
+```
+
+The test intercepts its F24 key events on Windows so they are not sent to other applications. It checks sustained heartbeats, heartbeat timeout, malformed heartbeats, recovery, release-all, and disconnect behavior using the real BLE and USB HID path.

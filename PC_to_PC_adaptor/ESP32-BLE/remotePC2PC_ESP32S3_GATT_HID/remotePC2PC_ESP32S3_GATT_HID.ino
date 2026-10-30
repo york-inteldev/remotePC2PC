@@ -228,6 +228,11 @@ static uint8_t mouseButtonMask(uint8_t button) {
 }
 
 static void processFrame() {
+    if (watchdogReleased && messageType != MSG_HEARTBEAT &&
+        messageType != MSG_RELEASE_ALL) {
+        return;
+    }
+
     switch (messageType) {
     case MSG_MOUSE_MOVE:
         if (payloadLength == 4) {

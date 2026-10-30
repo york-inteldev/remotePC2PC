@@ -70,6 +70,9 @@ if sys.platform == "win32":
 
 
 class CameraCapture:
+    # Roughly one second of consecutive failed reads before reporting an error.
+    MAX_READ_FAILURES = 20
+
     def __init__(self, device_index: int) -> None:
         self.device_index = device_index
         self._stop = threading.Event()
@@ -93,15 +96,21 @@ class CameraCapture:
                 return
 
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            failures = 0
             while not self._stop.is_set():
                 ok, frame = capture.read()
                 if ok and frame is not None:
+                    failures = 0
                     with self._lock:
                         self._frame = frame
-                elif self._stop.wait(0.05):
+                        self._error = None
+                    continue
+                if self._stop.wait(0.05):
                     break
-                else:
-                    self._error = "The capture device stopped returning frames."
+                failures += 1
+                if failures == self.MAX_READ_FAILURES:
+                    with self._lock:
+                        self._error = "The capture device stopped returning frames."
         except cv2.error as exc:
             self._error = f"Camera error: {exc}"
         finally:
@@ -114,9 +123,11 @@ class CameraCapture:
             self._frame = None
             return frame
 
-    @property
-    def error(self) -> str | None:
-        return self._error
+    def take_error(self) -> str | None:
+        """Return the pending error once so it does not keep overwriting the status."""
+        with self._lock:
+            error, self._error = self._error, None
+        return error
 
     def stop(self) -> None:
         self._stop.set()
@@ -163,6 +174,7 @@ class RemoteKvmApp:
         self._fractional_dx = 0.0
         self._fractional_dy = 0.0
         self._wheel_remainder = 0.0
+        self._pressed_keys: dict[int, int] = {}
 
         self._build_ui()
         self._on_transport_changed()
@@ -251,8 +263,6 @@ class RemoteKvmApp:
         self.canvas.bind("<Motion>", self._on_mouse_motion)
         self.canvas.bind("<Leave>", self._on_canvas_leave)
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
-        self.canvas.bind("<ButtonPress-4>", lambda event: self._send_wheel_at(event, 1))
-        self.canvas.bind("<ButtonPress-5>", lambda event: self._send_wheel_at(event, -1))
 
         for event_button, hid_button in ((1, 1), (3, 2), (2, 3)):
             self.canvas.bind(
@@ -517,13 +527,7 @@ class RemoteKvmApp:
         port = self.serial_port
         self.serial_port = None
         self.serial_ready = False
-        self.active_transport = None
-        self.forward_input.set(False)
-        self._reset_pointer_state()
-        if self.closing:
-            self._uninstall_mouse_hook()
-        else:
-            self.root.after_idle(self._uninstall_mouse_hook)
+        self._reset_connection_state()
         if port is not None:
             try:
                 port.close()
@@ -535,6 +539,12 @@ class RemoteKvmApp:
     def _drop_ble(self, status: str) -> None:
         self.ble_ready = False
         self.ble_connecting = False
+        self._reset_connection_state()
+        self.ble_link.disconnect()
+        self._update_connection_controls()
+        self.status.set(status)
+
+    def _reset_connection_state(self) -> None:
         self.active_transport = None
         self.forward_input.set(False)
         self._reset_pointer_state()
@@ -542,9 +552,6 @@ class RemoteKvmApp:
             self._uninstall_mouse_hook()
         else:
             self.root.after_idle(self._uninstall_mouse_hook)
-        self.ble_link.disconnect()
-        self._update_connection_controls()
-        self.status.set(status)
 
     def _write_packet(self, packet: bytes) -> bool:
         port = self.serial_port
@@ -601,13 +608,15 @@ class RemoteKvmApp:
         self._fractional_dx = 0.0
         self._fractional_dy = 0.0
         self._wheel_remainder = 0.0
+        self._pressed_keys.clear()
 
     def _poll_camera(self) -> None:
         if self.closing:
             return
         if self.camera is not None:
-            if self.camera.error:
-                self.status.set(self.camera.error)
+            error = self.camera.take_error()
+            if error:
+                self.status.set(error)
             frame = self.camera.latest_frame()
             if frame is not None:
                 self._last_frame = frame
@@ -727,8 +736,7 @@ class RemoteKvmApp:
                 return None
             self.canvas.focus_set()
             self._update_pointer(point)
-        if not self._write_packet(protocol.mouse_button_packet(button, pressed)):
-            return "break"
+        self._write_packet(protocol.mouse_button_packet(button, pressed))
         return "break"
 
     def _install_mouse_hook(self) -> None:
@@ -757,38 +765,44 @@ class RemoteKvmApp:
         self._mouse_hook_proc = None
 
     def _on_windows_mouse_hook(self, code: int, message: int, data_pointer: int) -> int:
-        if (
-            code >= 0
-            and message in (WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK)
-            and not self.closing
-            and self._is_forwarding()
-        ):
-            mouse_data = ctypes.cast(
-                data_pointer, ctypes.POINTER(_MouseHookData)
-            ).contents
-            xbutton = (mouse_data.mouse_data >> 16) & 0xFFFF
-            if xbutton in (1, 2):
-                try:
-                    canvas_x = mouse_data.point.x - self.canvas.winfo_rootx()
-                    canvas_y = mouse_data.point.y - self.canvas.winfo_rooty()
-                except tk.TclError:
-                    canvas_x = -1
-                    canvas_y = -1
-                point = self._point_to_normalized(canvas_x, canvas_y)
-                if point is not None:
-                    pressed = message != WM_XBUTTONUP
-                    if pressed:
-                        self.canvas.focus_set()
-                    self._update_pointer(point)
-                    self._write_packet(
-                        protocol.mouse_button_packet(3 + xbutton, pressed)
-                    )
+        # An exception must never skip CallNextHookEx or PC B's mouse input stalls.
+        try:
+            self._forward_xbutton(code, message, data_pointer)
+        except Exception as exc:
+            self.status.set(f"Extra mouse-button forwarding failed: {exc}")
 
         if _USER32 is None:
             return 0
         return _USER32.CallNextHookEx(
             self._mouse_hook_handle, code, message, data_pointer
         )
+
+    def _forward_xbutton(self, code: int, message: int, data_pointer: int) -> None:
+        if (
+            code < 0
+            or message not in (WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK)
+            or self.closing
+            or not self._is_forwarding()
+        ):
+            return
+
+        mouse_data = ctypes.cast(data_pointer, ctypes.POINTER(_MouseHookData)).contents
+        xbutton = (mouse_data.mouse_data >> 16) & 0xFFFF
+        if xbutton not in (1, 2):
+            return
+        try:
+            canvas_x = mouse_data.point.x - self.canvas.winfo_rootx()
+            canvas_y = mouse_data.point.y - self.canvas.winfo_rooty()
+        except tk.TclError:
+            return
+        point = self._point_to_normalized(canvas_x, canvas_y)
+        if point is None:
+            return
+        pressed = message != WM_XBUTTONUP
+        if pressed:
+            self.canvas.focus_set()
+        self._update_pointer(point)
+        self._write_packet(protocol.mouse_button_packet(3 + xbutton, pressed))
 
     def _send_wheel_units(self, amount: int, horizontal: bool = False) -> None:
         while amount:
@@ -798,16 +812,6 @@ class RemoteKvmApp:
             ):
                 return
             amount -= step
-
-    def _send_wheel_at(self, event, amount: int, horizontal: bool = False):
-        if not self._is_forwarding():
-            return None
-        point = self._point_to_normalized(event.x, event.y)
-        if point is None:
-            return None
-        self._update_pointer(point)
-        self._send_wheel_units(amount, horizontal)
-        return "break"
 
     def _on_mouse_wheel(self, event):
         if not self._is_forwarding():
@@ -837,10 +841,20 @@ class RemoteKvmApp:
         if point is None:
             return None
         self._update_pointer(point)
-        usage = keysym_to_usage(event.keysym)
-        if usage is None:
-            self.status.set(f"Unsupported key: {event.keysym}")
-            return "break"
+        if pressed:
+            usage = keysym_to_usage(event.keysym)
+            if usage is None:
+                self.status.set(f"Unsupported key: {event.keysym}")
+                return "break"
+            self._pressed_keys[event.keycode] = usage
+        else:
+            # The keysym can change while held (e.g. Shift released first), so
+            # release the usage that was sent on press.
+            usage = self._pressed_keys.pop(event.keycode, None)
+            if usage is None:
+                usage = keysym_to_usage(event.keysym)
+                if usage is None:
+                    return "break"
         self._write_packet(protocol.key_packet(usage, pressed))
         return "break"
 

@@ -1,6 +1,6 @@
 # PC B to PC C Remote KVM
 
-PC B displays a UVC USB capture adapter and forwards mouse/keyboard events to PC C. Choose either the existing two-Pico USB CDC/UART path or the ESP32-S3 BLE GATT path. The final board presents separate USB keyboard and mouse HID interfaces to PC C.
+PC B displays a UVC USB capture adapter and forwards mouse/keyboard events to PC C. Choose either the existing two-Pico USB CDC/UART path or the ESP32-S3 BLE GATT path. The final board presents USB keyboard and mouse HID devices to PC C. Pico 2 uses separate USB HID interfaces.
 
 ## Connections
 

@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 import cv2
 import numpy as np
 
+import protocol
 from pc_b_remote_kvm import CameraCapture, RemoteKvmApp
 
 
@@ -40,12 +41,71 @@ class CameraTests(unittest.TestCase):
         self.assertIs(camera.latest_frame(), frame)
         self.assertIsNone(camera.latest_frame())
 
+    def test_transient_read_failures_do_not_report_an_error(self):
+        camera = CameraCapture(0)
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        results = [(False, None)] * (CameraCapture.MAX_READ_FAILURES - 1)
+        results.append((True, frame))
+        capture = Mock()
+        capture.isOpened.return_value = True
+
+        def read():
+            if not results:
+                camera._stop.set()
+                return False, None
+            return results.pop(0)
+
+        capture.read.side_effect = read
+        with patch("pc_b_remote_kvm.cv2.VideoCapture", return_value=capture):
+            with patch.object(camera._stop, "wait", return_value=False):
+                camera._capture()
+
+        self.assertIsNone(camera.take_error())
+
+    def test_persistent_read_failures_report_a_single_error(self):
+        camera = CameraCapture(0)
+        reads = [(False, None)] * (CameraCapture.MAX_READ_FAILURES + 1)
+        capture = Mock()
+        capture.isOpened.return_value = True
+
+        def read():
+            if len(reads) == 1:
+                camera._stop.set()
+            return reads.pop(0)
+
+        capture.read.side_effect = read
+        with patch("pc_b_remote_kvm.cv2.VideoCapture", return_value=capture):
+            with patch.object(camera._stop, "wait", return_value=False):
+                camera._capture()
+
+        self.assertIn("stopped returning frames", camera.take_error())
+        self.assertIsNone(camera.take_error())
+
+    def test_key_release_uses_the_usage_sent_on_press(self):
+        app = RemoteKvmApp.__new__(RemoteKvmApp)
+        app._is_forwarding = Mock(return_value=True)
+        app._pointer_position_in_video = Mock(return_value=(0.5, 0.5))
+        app._update_pointer = Mock()
+        app._write_packet = Mock(return_value=True)
+        app._pressed_keys = {}
+
+        # Shift+minus on a Japanese layout yields "equal"; releasing Shift
+        # first turns the release event into "minus".
+        app._forward_key(SimpleNamespace(keysym="equal", keycode=189), True)
+        app._forward_key(SimpleNamespace(keysym="minus", keycode=189), False)
+
+        self.assertEqual(
+            [call.args[0] for call in app._write_packet.call_args_list],
+            [protocol.key_packet(0x2E, True), protocol.key_packet(0x2E, False)],
+        )
+        self.assertEqual(app._pressed_keys, {})
+
     def test_poll_only_renders_new_frames_and_resize_renders_last_frame(self):
         app = RemoteKvmApp.__new__(RemoteKvmApp)
         app.closing = False
         app.root = Mock()
         app.camera = Mock()
-        app.camera.error = None
+        app.camera.take_error.return_value = None
         frame = np.zeros((2, 3, 3), dtype=np.uint8)
         app.camera.latest_frame.side_effect = [frame, None]
         app._last_frame = None

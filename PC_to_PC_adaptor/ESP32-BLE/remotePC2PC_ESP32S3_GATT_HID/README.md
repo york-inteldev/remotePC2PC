@@ -12,18 +12,24 @@ PC C receives USB HID and does not need Bluetooth. This differs from the legacy 
 
 ## Hardware and Arduino IDE
 
-Connect the ESP32-S3 board's **native USB-OTG** connector to PC C during operation. Do not assume that a connector labeled USB is the native USB-OTG port; check the board schematic. If the board has a separate USB-UART connector, use it to upload. If it exposes only native USB-OTG, temporarily connect that port to the development PC and select **Upload Mode: USB-OTG CDC (TinyUSB)** for flashing, then reconnect it to PC C.
+Connect the ESP32-S3 board's **native USB-OTG** connector to PC C during operation. Do not assume that a connector labeled USB is the native USB-OTG port; check the board schematic. If the board has a separate USB-UART connector, use it to upload. Boards such as the XIAO ESP32-S3 can instead use the same native USB connector for the ROM USB-Serial/JTAG download interface: temporarily connect it to the development PC and enter download mode before uploading, then reconnect it to PC C.
+
+For a Seeed Studio XIAO ESP32-S3, connect its external 2.4 GHz U.FL antenna with USB power disconnected. Without the antenna, BLE reception can be extremely weak or unreliable.
 
 Install the **esp32 by Espressif Systems** Arduino board package, version **3.0.7 or newer**, then select:
 
 - Board: **ESP32S3 Dev Module** (or the exact ESP32-S3 board)
 - USB Mode: **USB-OTG (TinyUSB)**
 - USB CDC On Boot: **Disabled**
-- Upload Mode: **UART0 / Hardware CDC** for a separate USB-UART upload connector, or **USB-OTG CDC (TinyUSB)** for boards using native USB to upload
+- Upload Mode: **UART0 / Hardware CDC** for a separate USB-UART connector or the ROM USB-Serial/JTAG interface
 
-The firmware registers separate USB keyboard and mouse HID interfaces. ESP32-S3 USB-OTG and USB-Serial/JTAG share a PHY, so the USB-Serial/JTAG interface cannot be used concurrently with USB-OTG HID. This sketch does not start a USB serial console.
+For XIAO ESP32-S3, select **XIAO_ESP32S3**, 8 MB flash, and the default 8 MB partition scheme. Its USB CDC On Boot default may be enabled, so explicitly disable it.
+
+With Arduino-ESP32 3.0.7, the firmware exposes separate keyboard and mouse HID collections in one USB HID interface; Windows enumerates them as separate keyboard and mouse devices. ESP32-S3 USB-OTG and USB-Serial/JTAG share a PHY, so the USB-Serial/JTAG interface cannot be used concurrently with USB-OTG HID. This sketch does not start a USB serial console.
 
 Open `remotePC2PC_ESP32S3_GATT_HID.ino` and upload it to the ESP32-S3. On PC C, connect the native USB-OTG port. The board advertises as `RemotePC2PC-S3`.
+
+If the board remains in upload mode after flashing, disconnect and reconnect USB without holding BOOT. To flash again through the native connector when only HID is exposed, hold BOOT while resetting or reconnecting the board, then release BOOT and select the ROM USB-Serial/JTAG port. The running firmware does not expose USB CDC, so a TinyUSB CDC upload cannot automatically reset it into download mode.
 
 ## PC B application
 
@@ -54,7 +60,7 @@ Each GATT write contains one complete frame in the existing format:
 A5 5A | message type | payload length | payload | XOR checksum
 ```
 
-The maximum current frame is 13 bytes, which fits within the default 20-byte ATT write payload. Message types and payloads are documented in the [PC_App README](../../../PC_App/README.md). The PC B application sends a heartbeat every 500 ms; the firmware releases all held inputs after 1.5 seconds without a heartbeat and immediately when BLE disconnects.
+The maximum current frame is 13 bytes, which fits within the default 20-byte ATT write payload. Message types and payloads are documented in the [PC_App README](../../../PC_App/README.md). The PC B application sends a heartbeat every 500 ms; the firmware releases all held inputs after 1.5 seconds without a heartbeat and immediately when BLE disconnects. After a heartbeat timeout, it ignores input commands until a valid heartbeat arrives; release-all remains available.
 
 ## Security and validation
 
